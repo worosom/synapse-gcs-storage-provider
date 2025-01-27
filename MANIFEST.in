@@ -1,4 +1,4 @@
 include LICENSE
 include *.md
 
-exclude test_s3.py
+exclude test_gcs.py
