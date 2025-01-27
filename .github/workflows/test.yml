@@ -19,34 +19,27 @@ jobs:
       with: 
         uploadLogs: true
         httpPort: 8008
-        customModules: "synapse-s3-storage-provider"
+        customModules: "synapse-gcs-storage-provider"
         customConfig: |
           registration_shared_secret: QuadraticPeach
           media_storage_providers:
-            - module: s3_storage_provider.S3StorageProviderBackend
+            - module: gcs_storage_provider.GCSStorageProviderBackend
               store_local: True
               store_remote: True
               store_synchronous: True
               config:
-                bucket: s3-storage-provider-tester
-                endpoint_url: http://127.0.0.1:9000/
-                access_key_id: my_access_key_id
-                secret_access_key: my_secret_access_key
-    - name: Setup minio
+                bucket: gcs-storage-provider-test
+                project: test-project
+    - name: Setup GCS emulator
       run: |
-        # The version of minio is RELEASE.2022-04-01T03-41-39Z.fips
-        docker run -d -p 9000:9000 --name minio \
-                   -e "MINIO_ACCESS_KEY=my_access_key_id" \
-                   -e "MINIO_SECRET_KEY=my_secret_access_key" \
-                   -v /tmp/data:/data \
-                   -v /tmp/config:/root/.minio \
-                   minio/minio@sha256:b615ce0f18c2adf111c31b751cb79b69551b62a620e85930f6b5b28e7265b0c1 \
-                   server /data
-        export AWS_ACCESS_KEY_ID=my_access_key_id
-        export AWS_SECRET_ACCESS_KEY=my_secret_access_key
-        export AWS_EC2_METADATA_DISABLED=true
-
-        aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://s3-storage-provider-tester
+        # Install and start the GCS emulator
+        docker run -d -p 8081:8081 --name gcs-emulator fsouza/fake-gcs-server:latest -scheme http -public-host localhost:8081
+        # Wait for emulator to start
+        sleep 5
+        # Create test bucket
+        curl -X POST -H "Content-Type: application/json" -d '{"name":"gcs-storage-provider-test"}' http://localhost:8081/storage/v1/b
+        # Set environment variables for GCS client
+        echo "STORAGE_EMULATOR_HOST=http://localhost:8081" >> $GITHUB_ENV
     - name: Confirm happy path case
       run: |
         set -x 
@@ -54,12 +47,13 @@ jobs:
         synapse/env/bin/register_new_matrix_user -k QuadraticPeach -u test -p test --no-admin http://127.0.0.1:8008
         access_token=`curl -q -XPOST -d '{"type":"m.login.password", "user":"test", "password":"test"}' "http://127.0.0.1:8008/_matrix/client/r0/login" | jq -r .access_token`
         #Upload file to synapse
-        mxc=`curl -q -H "Authorization: Bearer $access_token" http://127.0.0.1:8008/_matrix/media/v3/upload --data-binary @s3_storage_provider.py | jq -r .content_uri`
+        mxc=`curl -q -H "Authorization: Bearer $access_token" http://127.0.0.1:8008/_matrix/media/v3/upload --data-binary @gcs_storage_provider.py | jq -r .content_uri`
         server_name=`echo $mxc | sed 's^mxc://\(.*\)/.*^\1^'`
         media_id=`echo $mxc | sed 's^mxc://.*/\(.*\)^\1^'`
         #Downloading uploaded file
         curl -q -o round_trip http://127.0.0.1:8008/_matrix/media/v3/download/${server_name}/${media_id}/
         #Verify file against original
-        diff round_trip s3_storage_provider.py
-        #Verify file against minio data store
-        diff /tmp/data/s3-storage-provider-tester/local_content/*/*/* s3_storage_provider.py
+        diff round_trip gcs_storage_provider.py
+        #Verify file in GCS emulator
+        curl -o gcs_file "http://localhost:8081/storage/v1/b/gcs-storage-provider-test/o/local_content%2F${media_id:0:2}%2F${media_id:2:2}%2F${media_id:4}/contents"
+        diff gcs_file gcs_storage_provider.py
