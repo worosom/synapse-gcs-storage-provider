@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2018 New Vector Ltd
-# Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright 2024 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,10 +17,8 @@ import logging
 import os
 import threading
 
-from six import string_types
-
-import boto3
-import botocore
+from google.cloud import storage
+from google.api_core import exceptions as gcs_exceptions
 
 from twisted.internet import defer, reactor, threads
 from twisted.python.failure import Failure
@@ -37,22 +34,21 @@ try:
 except ImportError:
     current_context = LoggingContext.current_context
 
-logger = logging.getLogger("synapse.s3")
+logger = logging.getLogger("synapse.gcs")
 
-
-# The list of valid AWS storage class names
+# The list of valid GCS storage class names
 _VALID_STORAGE_CLASSES = (
     "STANDARD",
-    "REDUCED_REDUNDANCY",
-    "STANDARD_IA",
-    "INTELLIGENT_TIERING",
+    "NEARLINE",
+    "COLDLINE",
+    "ARCHIVE",
 )
 
-# Chunk size to use when reading from s3 connection in bytes
+# Chunk size to use when reading from GCS connection in bytes
 READ_CHUNK_SIZE = 16 * 1024
 
 
-class S3StorageProviderBackend(StorageProvider):
+class GCSStorageProviderBackend(StorageProvider):
     """
     Args:
         hs (HomeServer)
@@ -61,62 +57,39 @@ class S3StorageProviderBackend(StorageProvider):
 
     def __init__(self, hs, config):
         self.cache_directory = hs.config.media.media_store_path
-        self.bucket = config["bucket"]
+        self.bucket_name = config["bucket"]
         self.prefix = config["prefix"]
-        # A dictionary of extra arguments for uploading files.
-        # See https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/s3.html#boto3.s3.transfer.S3Transfer.ALLOWED_UPLOAD_ARGS
-        # for a list of possible keys.
-        self.extra_args = config["extra_args"]
-        self.api_kwargs = {}
+        self.storage_class = config["storage_class"]
+        self.project = config.get("project")
+        self.credentials = config.get("credentials")
 
-        if "region_name" in config:
-            self.api_kwargs["region_name"] = config["region_name"]
-
-        if "endpoint_url" in config:
-            self.api_kwargs["endpoint_url"] = config["endpoint_url"]
-
-        if "access_key_id" in config:
-            self.api_kwargs["aws_access_key_id"] = config["access_key_id"]
-
-        if "secret_access_key" in config:
-            self.api_kwargs["aws_secret_access_key"] = config["secret_access_key"]
-
-        if "session_token" in config:
-            self.api_kwargs["aws_session_token"] = config["session_token"]
-
-        self._s3_client = None
-        self._s3_client_lock = threading.Lock()
+        self._gcs_client = None
+        self._gcs_client_lock = threading.Lock()
 
         threadpool_size = config.get("threadpool_size", 40)
-        self._s3_pool = ThreadPool(name="s3-pool", maxthreads=threadpool_size)
-        self._s3_pool.start()
+        self._gcs_pool = ThreadPool(name="gcs-pool", maxthreads=threadpool_size)
+        self._gcs_pool.start()
 
-        # Manually stop the thread pool on shutdown. If we don't do this then
-        # stopping Synapse takes an extra ~30s as Python waits for the threads
-        # to exit.
+        # Manually stop the thread pool on shutdown to avoid ~30s delay
         reactor.addSystemEventTrigger(
-            "during", "shutdown", self._s3_pool.stop,
+            "during", "shutdown", self._gcs_pool.stop,
         )
 
-    def _get_s3_client(self):
-        # this method is designed to be thread-safe, so that we can share a
-        # single boto3 client across multiple threads.
-        #
-        # (XXX: is creating a client actually a blocking operation, or could we do
-        # this on the main thread, to simplify all this?)
+    def _get_gcs_client(self):
+        # Thread-safe singleton pattern for GCS client
+        if self._gcs_client:
+            return self._gcs_client
 
-        # first of all, do a fast lock-free check
-        s3 = self._s3_client
-        if s3:
-            return s3
+        with self._gcs_client_lock:
+            if not self._gcs_client:
+                client_args = {}
+                if self.project:
+                    client_args["project"] = self.project
+                if self.credentials:
+                    client_args["credentials"] = self.credentials
 
-        # no joy, grab the lock and repeat the check
-        with self._s3_client_lock:
-            s3 = self._s3_client
-            if not s3:
-                b3_session = boto3.session.Session()
-                self._s3_client = s3 = b3_session.client("s3", **self.api_kwargs)
-            return s3
+                self._gcs_client = storage.Client(**client_args)
+            return self._gcs_client
 
     def store_file(self, path, file_info):
         """See StorageProvider.store_file"""
@@ -125,15 +98,15 @@ class S3StorageProviderBackend(StorageProvider):
 
         def _store_file():
             with LoggingContext(parent_context=parent_logcontext):
-                self._get_s3_client().upload_file(
-                    Filename=os.path.join(self.cache_directory, path),
-                    Bucket=self.bucket,
-                    Key=self.prefix + path,
-                    ExtraArgs=self.extra_args,
-                )
+                client = self._get_gcs_client()
+                bucket = client.bucket(self.bucket_name)
+                blob = bucket.blob(self.prefix + path)
+                blob.storage_class = self.storage_class
+
+                blob.upload_from_filename(os.path.join(self.cache_directory, path))
 
         return make_deferred_yieldable(
-            threads.deferToThreadPool(reactor, self._s3_pool, _store_file)
+            threads.deferToThreadPool(reactor, self._gcs_pool, _store_file)
         )
 
     def fetch(self, path, file_info):
@@ -143,11 +116,11 @@ class S3StorageProviderBackend(StorageProvider):
         d = defer.Deferred()
 
         def _get_file():
-            s3_download_task(
-                self._get_s3_client(), self.bucket, self.prefix + path, self.extra_args, d, logcontext
+            gcs_download_task(
+                self._get_gcs_client(), self.bucket_name, self.prefix + path, d, logcontext
             )
 
-        self._s3_pool.callInThread(_get_file)
+        self._gcs_pool.callInThread(_get_file)
         return make_deferred_yieldable(d)
 
     @staticmethod
@@ -157,95 +130,84 @@ class S3StorageProviderBackend(StorageProvider):
 
         The returned value is passed into the constructor.
 
-        In this case we return a dict with fields, `bucket`, `prefix` and `storage_class`
+        In this case we return a dict with fields: bucket, prefix, storage_class,
+        and optionally project and credentials.
         """
         bucket = config["bucket"]
         prefix = config.get("prefix", "")
         storage_class = config.get("storage_class", "STANDARD")
 
-        assert isinstance(bucket, string_types)
+        assert isinstance(bucket, str)
         assert storage_class in _VALID_STORAGE_CLASSES
 
         result = {
             "bucket": bucket,
             "prefix": prefix,
-            "extra_args": {"StorageClass": storage_class},
+            "storage_class": storage_class,
         }
 
-        if "region_name" in config:
-            result["region_name"] = config["region_name"]
+        if "project" in config:
+            result["project"] = config["project"]
 
-        if "endpoint_url" in config:
-            result["endpoint_url"] = config["endpoint_url"]
+        if "credentials" in config:
+            result["credentials"] = config["credentials"]
 
-        if "access_key_id" in config:
-            result["access_key_id"] = config["access_key_id"]
-
-        if "secret_access_key" in config:
-            result["secret_access_key"] = config["secret_access_key"]
-
-        if "session_token" in config:
-            result["session_token"] = config["session_token"]
-
-        if "sse_customer_key" in config:
-            result["extra_args"]["SSECustomerKey"] = config["sse_customer_key"]
-            result["extra_args"]["SSECustomerAlgorithm"] = config.get(
-                "sse_customer_algo", "AES256"
-            )
+        if "threadpool_size" in config:
+            result["threadpool_size"] = config["threadpool_size"]
 
         return result
 
 
-def s3_download_task(s3_client, bucket, key, extra_args, deferred, parent_logcontext):
-    """Attempts to download a file from S3.
+def gcs_download_task(gcs_client, bucket_name, key, deferred, parent_logcontext):
+    """Attempts to download a file from GCS.
 
     Args:
-        s3_client: boto3 s3 client
-        bucket (str): The S3 bucket which may have the file
+        gcs_client: google.cloud.storage.Client instance
+        bucket_name (str): The GCS bucket which may have the file
         key (str): The key of the file
-        deferred (Deferred[_S3Responder|None]): If file exists
-            resolved with an _S3Responder instance, if it doesn't
+        deferred (Deferred[_GCSResponder|None]): If file exists
+            resolved with an _GCSResponder instance, if it doesn't
             exist then resolves with None.
         parent_logcontext (LoggingContext): the logcontext to report logs and metrics
             against.
     """
     with LoggingContext(parent_context=parent_logcontext):
-        logger.info("Fetching %s from S3", key)
+        logger.info("Fetching %s from GCS", key)
 
         try:
-            if "SSECustomerKey" in extra_args and "SSECustomerAlgorithm" in extra_args:
-                resp = s3_client.get_object(
-                    Bucket=bucket,
-                    Key=key,
-                    SSECustomerKey=extra_args["SSECustomerKey"],
-                    SSECustomerAlgorithm=extra_args["SSECustomerAlgorithm"],
-                )
-            else:
-                resp = s3_client.get_object(Bucket=bucket, Key=key)
+            bucket = gcs_client.bucket(bucket_name)
+            blob = bucket.get_blob(key)
 
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] in ("404", "NoSuchKey",):
-                logger.info("Media %s not found in S3", key)
+            if not blob:
+                logger.info("Media %s not found in GCS", key)
                 reactor.callFromThread(deferred.callback, None)
                 return
 
+            producer = _GCSResponder()
+            reactor.callFromThread(deferred.callback, producer)
+
+            # Download in chunks
+            stream = blob.download_as_bytes(chunk_size=READ_CHUNK_SIZE)
+            _stream_to_producer(reactor, producer, stream, timeout=90.0)
+
+        except gcs_exceptions.NotFound:
+            logger.info("Media %s not found in GCS", key)
+            reactor.callFromThread(deferred.callback, None)
+            return
+        except Exception:
             reactor.callFromThread(deferred.errback, Failure())
             return
 
-        producer = _S3Responder()
-        reactor.callFromThread(deferred.callback, producer)
-        _stream_to_producer(reactor, producer, resp["Body"], timeout=90.0)
 
-
-def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
+def _stream_to_producer(reactor, producer, stream, status=None, timeout=None):
     """Streams a file like object to the producer.
 
     Correctly handles producer being paused/resumed/stopped.
 
     Args:
         reactor
-        producer (_S3Responder): Producer object to stream results to
-        body (file like): The object to read from
+        producer (_GCSResponder): Producer object to stream results to
+        stream: The GCS download stream to read from
         status (_ProducerStatus|None): Used to track whether we're currently
             paused or not. Used for testing
         timeout (float|None): Timeout in seconds to wait for consume to resume
@@ -262,7 +224,13 @@ def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
         status = _ProducerStatus()
 
     try:
-        while not stop_event.is_set():
+        for chunk in stream:
+            if stop_event.is_set():
+                return
+
+            reactor.callFromThread(producer._write, chunk)
+
+            # After writing the chunk, check if we need to pause
             # We wait for the producer to signal that the consumer wants
             # more data (or we should abort)
             if not wakeup_event.is_set():
@@ -272,33 +240,25 @@ def _stream_to_producer(reactor, producer, body, status=None, timeout=None):
                     raise Exception("Timed out waiting to resume")
                 status.set_paused(False)
 
-            # Check if we were woken up so that we abort the download
+            # Check if we were woken up so that we should abort the download
             if stop_event.is_set():
                 return
-
-            chunk = body.read(READ_CHUNK_SIZE)
-            if not chunk:
-                return
-
-            reactor.callFromThread(producer._write, chunk)
 
     except Exception:
         reactor.callFromThread(producer._error, Failure())
     finally:
         reactor.callFromThread(producer._finish)
-        if body:
-            body.close()
 
 
-class _S3Responder(Responder):
-    """A Responder for S3. Created by _S3DownloadThread
+class _GCSResponder(Responder):
+    """A Responder for GCS. Created by gcs_download_task
     """
 
     def __init__(self):
         # Triggered by responder when more data has been requested (or
         # stop_event has been triggered)
         self.wakeup_event = threading.Event()
-        # Trigered by responder when we should abort the download.
+        # Triggered by responder when we should abort the download.
         self.stop_event = threading.Event()
 
         # The consumer we're registered to
@@ -325,7 +285,7 @@ class _S3Responder(Responder):
     def resumeProducing(self):
         """See IPushProducer.resumeProducing
         """
-        # The consumer is asking for more data, signal _S3DownloadThread
+        # The consumer is asking for more data, signal gcs_download_task
         self.wakeup_event.set()
 
     def pauseProducing(self):
@@ -336,21 +296,21 @@ class _S3Responder(Responder):
     def stopProducing(self):
         """See IPushProducer.stopProducing
         """
-        # The consumer wants no more data ever, signal _S3DownloadThread
+        # The consumer wants no more data ever, signal gcs_download_task
         self.stop_event.set()
         self.wakeup_event.set()
         if not self.deferred.called:
             self.deferred.errback(Exception("Consumer ask to stop producing"))
 
     def _write(self, chunk):
-        """Writes the chunk of data to consumer. Called by _S3DownloadThread.
+        """Writes the chunk of data to consumer. Called by gcs_download_task.
         """
         if self.consumer and not self.stop_event.is_set():
             self.consumer.write(chunk)
 
     def _error(self, failure):
-        """Called when a fatal error occured while getting data. Called by
-        _S3DownloadThread.
+        """Called when a fatal error occurred while getting data. Called by
+        gcs_download_task.
         """
         if self.consumer:
             self.consumer.unregisterProducer()
@@ -360,7 +320,7 @@ class _S3Responder(Responder):
             self.deferred.errback(failure)
 
     def _finish(self):
-        """Called when there is no more data to write. Called by _S3DownloadThread.
+        """Called when there is no more data to write. Called by gcs_download_task.
         """
         if self.consumer:
             self.consumer.unregisterProducer()
@@ -371,7 +331,7 @@ class _S3Responder(Responder):
 
 
 class _ProducerStatus(object):
-    """Used to track whether the s3 download thread is currently paused
+    """Used to track whether the GCS download thread is currently paused
     waiting for consumer to resume. Used for testing.
     """
 

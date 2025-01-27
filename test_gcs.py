@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2018 New Vector Ltd
+# Copyright 2024 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ from threading import Event, Thread
 
 from mock import Mock
 
-from s3_storage_provider import _stream_to_producer, _S3Responder, _ProducerStatus
+from gcs_storage_provider import _stream_to_producer, _GCSResponder, _ProducerStatus
 
 
 class StreamingProducerTestCase(unittest.TestCase):
@@ -47,7 +47,7 @@ class StreamingProducerTestCase(unittest.TestCase):
         self.consumer.write.side_effect = write
 
         self.producer_status = _ProducerStatus()
-        self.producer = _S3Responder()
+        self.producer = _GCSResponder()
         self.thread = Thread(
             target=_stream_to_producer,
             args=(self.reactor, self.producer, self.body),
@@ -164,11 +164,14 @@ class Channel(object):
     def __init__(self):
         self._queue = Queue()
 
-    def read(self, _):
-        val = self._queue.get()
-        if isinstance(val, Exception):
-            raise val
-        return val
+    def __iter__(self):
+        while True:
+            val = self._queue.get()
+            if val is None:
+                break
+            if isinstance(val, Exception):
+                raise val
+            yield val
 
     def write(self, val):
         self._queue.put(val)
@@ -178,6 +181,3 @@ class Channel(object):
 
     def finish(self):
         self._queue.put(None)
-
-    def close(self):
-        pass
