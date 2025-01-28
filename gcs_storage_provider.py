@@ -16,6 +16,7 @@
 import logging
 import os
 import threading
+import mimetypes
 
 from google.cloud import storage
 from google.api_core import exceptions as gcs_exceptions
@@ -103,7 +104,17 @@ class GCSStorageProviderBackend(StorageProvider):
                 blob = bucket.blob(self.prefix + path)
                 blob.storage_class = self.storage_class
 
-                blob.upload_from_filename(os.path.join(self.cache_directory, path))
+                # Detect MIME type from file extension
+                content_type = mimetypes.guess_type(path)[0]
+                if content_type is None:
+                    # If we can't detect the type, use application/octet-stream
+                    content_type = "application/octet-stream"
+
+                # Upload with the detected content type
+                blob.upload_from_filename(
+                    os.path.join(self.cache_directory, path),
+                    content_type=content_type
+                )
 
         return make_deferred_yieldable(
             threads.deferToThreadPool(reactor, self._gcs_pool, _store_file)
